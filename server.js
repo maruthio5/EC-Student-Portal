@@ -1,42 +1,799 @@
 // =============================================================
-//  GPT Chintamani ECE Portal — Backend Server
-//  Node.js + Express + SQLite (better-sqlite3)
+//  GPT Chintamani ECE Portal — Backend Server v3
+//  Node.js + Express + SQLite (sqlite3 — no Python needed)
 //  Run:  npm install && node server.js
-//  Then open: http://localhost:3000
 // =============================================================
 
-const express  = require('express');
-const cors     = require('cors');
-const path     = require('path');
-const Database = require('better-sqlite3');
-const bcrypt   = require('bcryptjs');
-const jwt      = require('jsonwebtoken');
+const express = require('express');
+const cors    = require('cors');
+const path    = require('path');
+const sqlite3 = require('sqlite3').verbose();
+const { open } = require('sqlite');
+const bcrypt  = require('bcryptjs');
+const jwt     = require('jsonwebtoken');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
 const JWT_SECRET = process.env.JWT_SECRET || 'ece-portal-secret-2025';
 
-// ── Middleware ──────────────────────────────────────────────
 app.use(cors());
-app.use(express.json({ limit: '10mb' }));   // allow base64 images
+app.use(express.json({ limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ── Database ────────────────────────────────────────────────
-// On Railway: use /data for persistent storage
-// On Render: use __dirname (resets on redeploy — use Railway for persistence)
+// ── DB path ─────────────────────────────────────────────────
 const DB_PATH = process.env.RAILWAY_VOLUME_MOUNT_PATH
     ? path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH, 'ece_portal.db')
     : path.join(__dirname, 'ece_portal.db');
-const db = new Database(DB_PATH);
-console.log('[ECE] Database path:', DB_PATH);
-db.pragma('journal_mode = WAL');   // better concurrent read performance
-db.pragma('foreign_keys = ON');
 
-// ── Schema Init ─────────────────────────────────────────────
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id           TEXT PRIMARY KEY,
+let db;
+
+async function initDB() {
+    db = await open({ filename: DB_PATH, driver: sqlite3.Database });
+    await db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;');
+
+    await db.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE,
+        password TEXT NOT NULL, role TEXT NOT NULL,
+        name TEXT NOT NULL, phone_number TEXT,
+        employee_id TEXT, enrollment TEXT UNIQUE,
+        semester INTEGER, batch TEXT,
+        parent TEXT, address TEXT,
+        is_cr INTEGER DEFAULT 0, subjects TEXT DEFAULT '[]',
+        created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS attendance (
+        id TEXT PRIMARY KEY, student_id TEXT NOT NULL,
+        student_name TEXT NOT NULL, subject TEXT NOT NULL,
+        date TEXT NOT NULL, time TEXT, status TEXT NOT NULL,
+        semester INTEGER, batch TEXT, teacher_name TEXT,
+        created_at TEXT DEFAULT (datetime('now')),
+        UNIQUE(student_id, subject, date)
+    );
+    CREATE TABLE IF NOT EXISTS marks (
+        id TEXT PRIMARY KEY, student_id TEXT NOT NULL,
+        student_name TEXT NOT NULL, subject TEXT NOT NULL,
+        semester INTEGER, internal REAL DEFAULT 0,
+        assessment REAL DEFAULT 0, practical REAL DEFAULT 0,
+        percentage REAL DEFAULT 0,
+        created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS messages (
+        id TEXT PRIMARY KEY, sender_id TEXT NOT NULL,
+        sender_name TEXT NOT NULL, sender_role TEXT NOT NULL,
+        message TEXT, semester INTEGER, batch TEXT,
+        media_type TEXT, media_data TEXT,
+        file_name TEXT, file_size TEXT,
+        expires_at TEXT, seen_by TEXT DEFAULT '[]',
+        timestamp TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS notices (
+        id TEXT PRIMARY KEY, title TEXT NOT NULL,
+        content TEXT NOT NULL, priority TEXT DEFAULT 'medium',
+        date TEXT, created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS events (
+        id TEXT PRIMARY KEY, title TEXT NOT NULL,
+        date TEXT NOT NULL, type TEXT NOT NULL,
+        description TEXT, created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS leave_requests (
+        id TEXT PRIMARY KEY, student_id TEXT NOT NULL,
+        student_name TEXT NOT NULL, type TEXT,
+        reason TEXT NOT NULL, from_date TEXT NOT NULL,
+        to_date TEXT NOT NULL, status TEXT DEFAULT 'pending',
+        created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS timetable (
+        id TEXT PRIMARY KEY, semester INTEGER NOT NULL,
+        batch TEXT NOT NULL, day TEXT NOT NULL,
+        subject TEXT NOT NULL, start_time TEXT NOT NULL,
+        end_time TEXT NOT NULL, teacher TEXT,
+        room TEXT, type TEXT, color INTEGER DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS achievements (
+        id TEXT PRIMARY KEY, category TEXT NOT NULL,
+        title TEXT NOT NULL, description TEXT,
+        student TEXT NOT NULL, semester TEXT,
+        date TEXT, tags TEXT DEFAULT '[]',
+        added_by TEXT, created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS project_groups (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL,
+        description TEXT, subject TEXT, deadline TEXT,
+        teacher_id TEXT, leader_id TEXT,
+        member_ids TEXT DEFAULT '[]',
+        semester INTEGER, batch TEXT,
+        created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS project_posts (
+        id TEXT PRIMARY KEY, group_id TEXT NOT NULL,
+        sender_id TEXT NOT NULL, sender_name TEXT NOT NULL,
+        sender_role TEXT NOT NULL, message TEXT,
+        status TEXT DEFAULT 'inprogress',
+        media_type TEXT, media_data TEXT,
+        file_name TEXT, file_size TEXT,
+        expires_at TEXT, likes TEXT DEFAULT '[]',
+        timestamp TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS notifications (
+        id TEXT PRIMARY KEY, type TEXT NOT NULL,
+        title TEXT NOT NULL, body TEXT,
+        target_role TEXT, target_user_id TEXT,
+        exclude_id TEXT, target_batch TEXT,
+        target_semester INTEGER, read_by TEXT DEFAULT '[]',
+        created_at TEXT DEFAULT (datetime('now'))
+    );
+    `);
+
+    await seedData();
+    console.log('[ECE] Database ready at:', DB_PATH);
+}
+
+// ── Seed ────────────────────────────────────────────────────
+async function seedData() {
+    const existing = await db.get("SELECT id FROM users WHERE role='admin' LIMIT 1");
+    if (existing) return;
+
+    console.log('[ECE] Seeding default data...');
+    const h = p => bcrypt.hashSync(p, 10);
+    const today = new Date().toISOString().split('T')[0];
+
+    const ins = (sql, params) => db.run(sql, params);
+
+    const uSql = `INSERT OR IGNORE INTO users (id,email,password,role,name,phone_number,employee_id,enrollment,semester,batch,is_cr,subjects) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`;
+    await ins(uSql, ['admin1','admin@gpchintamani.edu',h('admin123'),'admin','Admin User',null,null,null,null,null,0,'[]']);
+    await ins(uSql, ['admin2','cr2109474@gmail.com',h('admin123'),'admin','Admin CR',null,null,null,null,null,0,'[]']);
+    await ins(uSql, ['teacher1','teacher@gpchintamani.edu',h('teacher123'),'teacher','Prof. Ramesh Kumar','9876543210','EMP001',null,null,null,0,'["Digital Electronics","Microcontrollers"]']);
+    await ins(uSql, ['student1','student@gpchintamani.edu',h('student123'),'student','Rahul Kumar','9876543211',null,'2E24ECE001',3,'2024-2027',1,'[]']);
+    await ins(uSql, ['student2','priya.ece@gpchintamani.edu',h('student123'),'student','Priya Sharma','9876543212',null,'2E24ECE002',3,'2024-2027',0,'[]']);
+    await ins(uSql, ['student3','amit.ece@gpchintamani.edu',h('student123'),'student','Amit Patel','9876543213',null,'2E23ECE015',4,'2023-2026',0,'[]']);
+
+    await ins(`INSERT OR IGNORE INTO attendance VALUES (?,?,?,?,?,?,?,?,?,?,?)`,['att1','student1','Rahul Kumar','Digital Electronics',today,'10:30 AM','present',3,'2024-2027','Prof. Ramesh Kumar',today]);
+    await ins(`INSERT OR IGNORE INTO marks VALUES (?,?,?,?,?,?,?,?,?,?)`,['mark1','student1','Rahul Kumar','Digital Electronics',3,18,22,19,78.67,today]);
+    await ins(`INSERT OR IGNORE INTO marks VALUES (?,?,?,?,?,?,?,?,?,?)`,['mark2','student1','Rahul Kumar','Microcontrollers',3,16,25,21,82.67,today]);
+    await ins(`INSERT OR IGNORE INTO events VALUES (?,?,?,?,?,?)`,['evt1','Technical Symposium','2026-03-15','program','Annual technical symposium',today]);
+    await ins(`INSERT OR IGNORE INTO notices VALUES (?,?,?,?,?,?)`,['not1','Semester Fee Payment','Please pay semester fees before March 1st.','high','2026-02-18',today]);
+
+    const ttRows = [
+        ['tt1',3,'2024-2027','Mon','Digital Electronics','09:00','10:00','Prof. Ramesh Kumar','Lab 101','Lecture',0],
+        ['tt2',3,'2024-2027','Mon','Microcontrollers','10:00','11:00','Prof. Ramesh Kumar','Lab 102','Lecture',1],
+        ['tt3',3,'2024-2027','Tue','Digital Electronics Lab','09:00','11:00','Prof. Ramesh Kumar','Lab 101','Lab',0],
+        ['tt4',3,'2024-2027','Wed','Applied Mathematics','11:30','12:30','Prof. Anita Singh','Room 204','Lecture',2],
+        ['tt5',3,'2024-2027','Thu','Communication Systems','10:00','11:00','Prof. Vijay Patil','Room 301','Lecture',3],
+        ['tt6',3,'2024-2027','Fri','Project Work','14:00','16:00','Prof. Ramesh Kumar','Lab 101','Lab',0],
+    ];
+    for (const r of ttRows) await ins(`INSERT OR IGNORE INTO timetable VALUES (?,?,?,?,?,?,?,?,?,?,?)`, r);
+    console.log('[ECE] Seed complete.');
+}
+
+// ── Auth middleware ──────────────────────────────────────────
+function auth(req, res, next) {
+    const token = (req.headers.authorization || '').replace('Bearer ', '');
+    if (!token) return res.status(401).json({ error: 'No token' });
+    try { req.user = jwt.verify(token, JWT_SECRET); next(); }
+    catch(e) { res.status(401).json({ error: 'Invalid token' }); }
+}
+function adminOnly(req, res, next) {
+    if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+    next();
+}
+
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2,6);
+
+// ── ROUTES ───────────────────────────────────────────────────
+
+// AUTH
+app.post('/api/auth/login', async (req, res) => {
+    try {
+        const { email, password } = req.body;
+        const user = await db.get('SELECT * FROM users WHERE email=?', email);
+        if (!user) return res.status(401).json({ error: 'Invalid email or password' });
+        const valid = user.password.startsWith('$2')
+            ? bcrypt.compareSync(password, user.password)
+            : password === user.password;
+        if (!valid) return res.status(401).json({ error: 'Invalid email or password' });
+        const payload = {
+            id:user.id, email:user.email, role:user.role, name:user.name,
+            semester:user.semester, batch:user.batch, isCR:!!user.is_cr,
+            employeeId:user.employee_id, enrollmentNumber:user.enrollment,
+            phoneNumber:user.phone_number, subjects:JSON.parse(user.subjects||'[]')
+        };
+        res.json({ token: jwt.sign(payload, JWT_SECRET, {expiresIn:'7d'}), user: payload });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// USERS
+app.get('/api/users', auth, async (req, res) => {
+    const rows = await db.all('SELECT * FROM users');
+    res.json(rows.map(u => ({
+        id:u.id, email:u.email, role:u.role, name:u.name,
+        phoneNumber:u.phone_number, employeeId:u.employee_id,
+        enrollmentNumber:u.enrollment, semester:u.semester,
+        batch:u.batch, isCR:!!u.is_cr,
+        subjects:JSON.parse(u.subjects||'[]'),
+        parentContact:u.parent, address:u.address
+    })));
+});
+app.post('/api/users', auth, adminOnly, async (req, res) => {
+    try {
+        const u = req.body; const id = u.id||(u.role+uid());
+        await db.run(`INSERT INTO users (id,email,password,role,name,phone_number,employee_id,enrollment,semester,batch,is_cr,subjects,parent,address) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            [id,u.email,bcrypt.hashSync(u.password||'pass123',10),u.role,u.name,u.phoneNumber||null,u.employeeId||null,u.enrollmentNumber||null,u.semester||null,u.batch||null,u.isCR?1:0,JSON.stringify(u.subjects||[]),u.parentContact||null,u.address||null]);
+        res.json({ id, success:true });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+app.put('/api/users/:id', auth, adminOnly, async (req, res) => {
+    try {
+        const u = req.body;
+        await db.run(`UPDATE users SET name=?,email=?,phone_number=?,employee_id=?,enrollment=?,semester=?,batch=?,is_cr=?,subjects=?,parent=?,address=? WHERE id=?`,
+            [u.name,u.email,u.phoneNumber||null,u.employeeId||null,u.enrollmentNumber||null,u.semester||null,u.batch||null,u.isCR?1:0,JSON.stringify(u.subjects||[]),u.parentContact||null,u.address||null,req.params.id]);
+        if (u.password) await db.run('UPDATE users SET password=? WHERE id=?',[bcrypt.hashSync(u.password,10),req.params.id]);
+        res.json({ success:true });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+app.delete('/api/users/:id', auth, adminOnly, async (req, res) => {
+    await db.run('DELETE FROM users WHERE id=?', req.params.id);
+    res.json({ success:true });
+});
+
+// ATTENDANCE
+app.get('/api/attendance', auth, async (req, res) => {
+    let rows;
+    if (req.user.role==='student') rows = await db.all('SELECT * FROM attendance WHERE student_id=? ORDER BY date DESC', req.user.id);
+    else if (req.query.batch && req.query.semester) rows = await db.all('SELECT * FROM attendance WHERE batch=? AND semester=? ORDER BY date DESC',[req.query.batch,req.query.semester]);
+    else rows = await db.all('SELECT * FROM attendance ORDER BY date DESC');
+    res.json(rows);
+});
+app.post('/api/attendance', auth, async (req, res) => {
+    try {
+        const a=req.body; const id=a.id||'att'+uid();
+        await db.run(`INSERT OR REPLACE INTO attendance (id,student_id,student_name,subject,date,time,status,semester,batch,teacher_name) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+            [id,a.studentId,a.studentName,a.subject,a.date,a.time,a.status,a.semester,a.batch,a.teacherName||null]);
+        res.json({ id, success:true });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+app.delete('/api/attendance/:id', auth, async (req, res) => {
+    await db.run('DELETE FROM attendance WHERE id=?', req.params.id);
+    res.json({ success:true });
+});
+
+// MARKS
+app.get('/api/marks', auth, async (req, res) => {
+    const rows = req.user.role==='student'
+        ? await db.all('SELECT * FROM marks WHERE student_id=?', req.user.id)
+        : await db.all('SELECT * FROM marks');
+    res.json(rows.map(m=>({...m,total:(m.internal||0)+(m.assessment||0)+(m.practical||0)})));
+});
+app.post('/api/marks', auth, async (req, res) => {
+    try {
+        const m=req.body; const id=m.id||'mark'+uid();
+        await db.run(`INSERT OR REPLACE INTO marks (id,student_id,student_name,subject,semester,internal,assessment,practical,percentage) VALUES (?,?,?,?,?,?,?,?,?)`,
+            [id,m.studentId,m.studentName,m.subject,m.semester,m.internal||0,m.assessment||0,m.practical||0,m.percentage||0]);
+        res.json({ id, success:true });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+app.put('/api/marks/:id', auth, async (req, res) => {
+    const m=req.body;
+    await db.run('UPDATE marks SET internal=?,assessment=?,practical=?,percentage=? WHERE id=?',
+        [m.internal||0,m.assessment||0,m.practical||0,m.percentage||0,req.params.id]);
+    res.json({ success:true });
+});
+app.delete('/api/marks/:id', auth, async (req, res) => {
+    await db.run('DELETE FROM marks WHERE id=?', req.params.id);
+    res.json({ success:true });
+});
+
+// MESSAGES
+app.get('/api/messages', auth, async (req, res) => {
+    const rows = await db.all('SELECT * FROM messages WHERE batch=? AND semester=? ORDER BY timestamp ASC',[req.query.batch, req.query.semester]);
+    res.json(rows.map(m=>({...m,seenBy:JSON.parse(m.seen_by||'[]')})));
+});
+app.post('/api/messages', auth, async (req, res) => {
+    try {
+        const m=req.body; const id='msg'+uid();
+        const expiresAt=m.mediaType?new Date(Date.now()+5*60*60*1000).toISOString():null;
+        await db.run(`INSERT INTO messages (id,sender_id,sender_name,sender_role,message,semester,batch,media_type,media_data,file_name,file_size,expires_at,seen_by,timestamp) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            [id,req.user.id,req.user.name,req.user.role,m.message||null,m.semester,m.batch,m.mediaType||null,m.mediaData||null,m.fileName||null,m.fileSize||null,expiresAt,JSON.stringify([req.user.id]),new Date().toISOString()]);
+        res.json({ id, success:true });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+app.put('/api/messages/seen-batch', auth, async (req, res) => {
+    const msgs = await db.all('SELECT id,seen_by FROM messages WHERE batch=? AND semester=?',[req.body.batch,req.body.semester]);
+    for (const m of msgs) {
+        const seen=JSON.parse(m.seen_by||'[]');
+        if (!seen.includes(req.user.id)) { seen.push(req.user.id); await db.run('UPDATE messages SET seen_by=? WHERE id=?',[JSON.stringify(seen),m.id]); }
+    }
+    res.json({ success:true });
+});
+
+// NOTICES
+app.get('/api/notices', auth, async (req, res) => res.json(await db.all('SELECT * FROM notices ORDER BY created_at DESC')));
+app.post('/api/notices', auth, adminOnly, async (req, res) => {
+    const n=req.body; const id='not'+uid();
+    await db.run('INSERT INTO notices (id,title,content,priority,date) VALUES (?,?,?,?,?)',[id,n.title,n.content,n.priority||'medium',n.date||new Date().toISOString().split('T')[0]]);
+    res.json({ id, success:true });
+});
+app.delete('/api/notices/:id', auth, adminOnly, async (req, res) => {
+    await db.run('DELETE FROM notices WHERE id=?', req.params.id); res.json({ success:true });
+});
+
+// EVENTS
+app.get('/api/events', auth, async (req, res) => res.json(await db.all('SELECT * FROM events ORDER BY date ASC')));
+app.post('/api/events', auth, adminOnly, async (req, res) => {
+    const e=req.body; const id='evt'+uid();
+    await db.run('INSERT INTO events (id,title,date,type,description) VALUES (?,?,?,?,?)',[id,e.title,e.date,e.type,e.description||null]);
+    res.json({ id, success:true });
+});
+app.delete('/api/events/:id', auth, adminOnly, async (req, res) => {
+    await db.run('DELETE FROM events WHERE id=?', req.params.id); res.json({ success:true });
+});
+
+// LEAVE
+app.get('/api/leave', auth, async (req, res) => {
+    const rows = req.user.role==='student'
+        ? await db.all('SELECT * FROM leave_requests WHERE student_id=? ORDER BY created_at DESC', req.user.id)
+        : await db.all('SELECT * FROM leave_requests ORDER BY created_at DESC');
+    res.json(rows);
+});
+app.post('/api/leave', auth, async (req, res) => {
+    const l=req.body; const id='lv'+uid();
+    await db.run('INSERT INTO leave_requests (id,student_id,student_name,type,reason,from_date,to_date) VALUES (?,?,?,?,?,?,?)',
+        [id,req.user.id,req.user.name,l.type||null,l.reason,l.fromDate,l.toDate]);
+    res.json({ id, success:true });
+});
+app.put('/api/leave/:id', auth, async (req, res) => {
+    await db.run('UPDATE leave_requests SET status=? WHERE id=?',[req.body.status,req.params.id]);
+    res.json({ success:true });
+});
+
+// TIMETABLE
+app.get('/api/timetable', auth, async (req, res) => {
+    const rows = req.query.batch && req.query.semester
+        ? await db.all('SELECT * FROM timetable WHERE batch=? AND semester=? ORDER BY day,start_time',[req.query.batch,req.query.semester])
+        : await db.all('SELECT * FROM timetable ORDER BY semester,day,start_time');
+    res.json(rows.map(r=>({...r,startTime:r.start_time,endTime:r.end_time})));
+});
+app.post('/api/timetable', auth, async (req, res) => {
+    const t=req.body; const id=t.id||'tt'+uid();
+    await db.run('INSERT OR REPLACE INTO timetable (id,semester,batch,day,subject,start_time,end_time,teacher,room,type,color) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+        [id,t.semester,t.batch,t.day,t.subject,t.start||t.startTime,t.end||t.endTime,t.teacher||null,t.room||null,t.type||'Lecture',t.color||0]);
+    res.json({ id, success:true });
+});
+app.delete('/api/timetable/:id', auth, async (req, res) => {
+    await db.run('DELETE FROM timetable WHERE id=?', req.params.id); res.json({ success:true });
+});
+
+// ACHIEVEMENTS
+app.get('/api/achievements', auth, async (req, res) => {
+    const rows = await db.all('SELECT * FROM achievements ORDER BY created_at DESC');
+    res.json(rows.map(a=>({...a,tags:JSON.parse(a.tags||'[]')})));
+});
+app.post('/api/achievements', auth, async (req, res) => {
+    const a=req.body; const id='ach'+uid();
+    await db.run('INSERT INTO achievements (id,category,title,description,student,semester,date,tags,added_by) VALUES (?,?,?,?,?,?,?,?,?)',
+        [id,a.category,a.title,a.description||null,a.student,a.semester||null,a.date||null,JSON.stringify(a.tags||[]),req.user.id]);
+    res.json({ id, success:true });
+});
+app.delete('/api/achievements/:id', auth, async (req, res) => {
+    await db.run('DELETE FROM achievements WHERE id=?', req.params.id); res.json({ success:true });
+});
+
+// PROJECT GROUPS
+app.get('/api/project-groups', auth, async (req, res) => {
+    const rows = await db.all('SELECT * FROM project_groups ORDER BY created_at DESC');
+    res.json(rows.map(g=>({...g,memberIds:JSON.parse(g.member_ids||'[]'),teacherId:g.teacher_id,leaderId:g.leader_id})));
+});
+app.post('/api/project-groups', auth, async (req, res) => {
+    const g=req.body; const id='pg'+uid();
+    await db.run('INSERT INTO project_groups (id,name,description,subject,deadline,teacher_id,leader_id,member_ids,semester,batch) VALUES (?,?,?,?,?,?,?,?,?,?)',
+        [id,g.name,g.description||null,g.subject||null,g.deadline||null,g.teacherId||null,g.leaderId||req.user.id,JSON.stringify(g.memberIds||[req.user.id]),g.semester||null,g.batch||null]);
+    res.json({ id, success:true });
+});
+app.put('/api/project-groups/:id', auth, async (req, res) => {
+    const g=req.body;
+    await db.run('UPDATE project_groups SET name=?,description=?,subject=?,deadline=?,leader_id=?,member_ids=? WHERE id=?',
+        [g.name,g.description||null,g.subject||null,g.deadline||null,g.leaderId||null,JSON.stringify(g.memberIds||[]),req.params.id]);
+    res.json({ success:true });
+});
+
+// PROJECT POSTS
+app.get('/api/project-posts', auth, async (req, res) => {
+    const rows = req.query.groupId
+        ? await db.all('SELECT * FROM project_posts WHERE group_id=? ORDER BY timestamp ASC', req.query.groupId)
+        : await db.all('SELECT * FROM project_posts ORDER BY timestamp ASC');
+    res.json(rows.map(p=>({...p,groupId:p.group_id,senderId:p.sender_id,senderName:p.sender_name,senderRole:p.sender_role,mediaType:p.media_type,mediaData:p.media_data,fileName:p.file_name,fileSize:p.file_size,expiresAt:p.expires_at,likes:JSON.parse(p.likes||'[]')})));
+});
+app.post('/api/project-posts', auth, async (req, res) => {
+    const p=req.body; const id='pp'+uid();
+    await db.run('INSERT INTO project_posts (id,group_id,sender_id,sender_name,sender_role,message,status,media_type,media_data,file_name,file_size,expires_at,likes,timestamp) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        [id,p.groupId,req.user.id,req.user.name,req.user.role,p.message||null,p.status||'inprogress',p.mediaType||null,p.mediaData||null,p.fileName||null,p.fileSize||null,p.mediaType?new Date(Date.now()+5*60*60*1000).toISOString():null,'[]',new Date().toISOString()]);
+    res.json({ id, success:true });
+});
+
+// NOTIFICATIONS
+app.get('/api/notifications', auth, async (req, res) => {
+    const rows = await db.all(`SELECT * FROM notifications WHERE (target_user_id IS NULL OR target_user_id=?) AND (target_role IS NULL OR target_role=?) AND (exclude_id IS NULL OR exclude_id!=?) ORDER BY created_at DESC LIMIT 60`,
+        [req.user.id, req.user.role, req.user.id]);
+    res.json(rows.map(n=>({...n,readBy:JSON.parse(n.read_by||'[]'),isRead:JSON.parse(n.read_by||'[]').includes(req.user.id)})));
+});
+app.post('/api/notifications', auth, async (req, res) => {
+    const n=req.body; const id='notif'+uid();
+    await db.run('INSERT INTO notifications (id,type,title,body,target_role,target_user_id,exclude_id,target_batch,target_semester) VALUES (?,?,?,?,?,?,?,?,?)',
+        [id,n.type,n.title,n.body||null,n.targetRole||null,n.targetUserId||null,n.excludeId||null,n.targetBatch||null,n.targetSemester||null]);
+    res.json({ id, success:true });
+});
+app.put('/api/notifications/:id/read', auth, async (req, res) => {
+    const n = await db.get('SELECT read_by FROM notifications WHERE id=?', req.params.id);
+    if (!n) return res.status(404).json({ error:'Not found' });
+    const rb=JSON.parse(n.read_by||'[]');
+    if (!rb.includes(req.user.id)) rb.push(req.user.id);
+    await db.run('UPDATE notifications SET read_by=? WHERE id=?',[JSON.stringify(rb),req.params.id]);
+    res.json({ success:true });
+});
+app.put('/api/notifications/read-all', auth, async (req, res) => {
+    const rows = await db.all('SELECT id,read_by FROM notifications');
+    for (const n of rows) {
+        const rb=JSON.parse(n.read_by||'[]');
+        if (!rb.includes(req.user.id)) { rb.push(req.user.id); await db.run('UPDATE notifications SET read_by=? WHERE id=?',[JSON.stringify(rb),n.id]); }
+    }
+    res.json({ success:true });
+});
+
+// HEALTH
+app.get('/api/health', (req, res) => res.json({ status:'ok', time:new Date().toISOString(), version:'3.0' }));
+
+// SERVE FRONTEND
+app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+
+// ── START ────────────────────────────────────────────────────
+initDB().then(() => {
+    app.listen(PORT, HOST, () => {
+        console.log(`\n🎓 ECE Portal running at http://localhost:${PORT}\n`);
+    });
+}).catch(err => {
+    console.error('Failed to start:', err);
+    process.exit(1);
+});
+        id TEXT PRIMARY KEY, type TEXT NOT NULL,
+        title TEXT NOT NULL, body TEXT,
+        target_role TEXT, target_user_id TEXT,
+        exclude_id TEXT, target_batch TEXT,
+        target_semester INTEGER, read_by TEXT DEFAULT '[]',
+        created_at TEXT DEFAULT (datetime('now'))
+    );
+    `);
+
+    await seedData();
+    console.log('[ECE] Database ready at:', DB_PATH);
+}
+
+// ── Seed ────────────────────────────────────────────────────
+async function seedData() {
+    const existing = await db.get("SELECT id FROM users WHERE role='admin' LIMIT 1");
+    if (existing) return;
+
+    console.log('[ECE] Seeding default data...');
+    const h = p => bcrypt.hashSync(p, 10);
+    const today = new Date().toISOString().split('T')[0];
+
+    const ins = (sql, params) => db.run(sql, params);
+
+    const uSql = `INSERT OR IGNORE INTO users (id,email,password,role,name,phone_number,employee_id,enrollment,semester,batch,is_cr,subjects) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`;
+    await ins(uSql, ['admin1','admin@gpchintamani.edu',h('admin123'),'admin','Admin User',null,null,null,null,null,0,'[]']);
+    await ins(uSql, ['admin2','cr2109474@gmail.com',h('admin123'),'admin','Admin CR',null,null,null,null,null,0,'[]']);
+    await ins(uSql, ['teacher1','teacher@gpchintamani.edu',h('teacher123'),'teacher','Prof. Ramesh Kumar','9876543210','EMP001',null,null,null,0,'["Digital Electronics","Microcontrollers"]']);
+    await ins(uSql, ['student1','student@gpchintamani.edu',h('student123'),'student','Rahul Kumar','9876543211',null,'2E24ECE001',3,'2024-2027',1,'[]']);
+    await ins(uSql, ['student2','priya.ece@gpchintamani.edu',h('student123'),'student','Priya Sharma','9876543212',null,'2E24ECE002',3,'2024-2027',0,'[]']);
+    await ins(uSql, ['student3','amit.ece@gpchintamani.edu',h('student123'),'student','Amit Patel','9876543213',null,'2E23ECE015',4,'2023-2026',0,'[]']);
+
+    await ins(`INSERT OR IGNORE INTO attendance VALUES (?,?,?,?,?,?,?,?,?,?,?)`,['att1','student1','Rahul Kumar','Digital Electronics',today,'10:30 AM','present',3,'2024-2027','Prof. Ramesh Kumar',today]);
+    await ins(`INSERT OR IGNORE INTO marks VALUES (?,?,?,?,?,?,?,?,?,?)`,['mark1','student1','Rahul Kumar','Digital Electronics',3,18,22,19,78.67,today]);
+    await ins(`INSERT OR IGNORE INTO marks VALUES (?,?,?,?,?,?,?,?,?,?)`,['mark2','student1','Rahul Kumar','Microcontrollers',3,16,25,21,82.67,today]);
+    await ins(`INSERT OR IGNORE INTO events VALUES (?,?,?,?,?,?)`,['evt1','Technical Symposium','2026-03-15','program','Annual technical symposium',today]);
+    await ins(`INSERT OR IGNORE INTO notices VALUES (?,?,?,?,?,?)`,['not1','Semester Fee Payment','Please pay semester fees before March 1st.','high','2026-02-18',today]);
+
+    const ttRows = [
+        ['tt1',3,'2024-2027','Mon','Digital Electronics','09:00','10:00','Prof. Ramesh Kumar','Lab 101','Lecture',0],
+        ['tt2',3,'2024-2027','Mon','Microcontrollers','10:00','11:00','Prof. Ramesh Kumar','Lab 102','Lecture',1],
+        ['tt3',3,'2024-2027','Tue','Digital Electronics Lab','09:00','11:00','Prof. Ramesh Kumar','Lab 101','Lab',0],
+        ['tt4',3,'2024-2027','Wed','Applied Mathematics','11:30','12:30','Prof. Anita Singh','Room 204','Lecture',2],
+        ['tt5',3,'2024-2027','Thu','Communication Systems','10:00','11:00','Prof. Vijay Patil','Room 301','Lecture',3],
+        ['tt6',3,'2024-2027','Fri','Project Work','14:00','16:00','Prof. Ramesh Kumar','Lab 101','Lab',0],
+    ];
+    for (const r of ttRows) await ins(`INSERT OR IGNORE INTO timetable VALUES (?,?,?,?,?,?,?,?,?,?,?)`, r);
+    console.log('[ECE] Seed complete.');
+}
+
+// ── Auth middleware ──────────────────────────────────────────
+function auth(req, res, next) {
+    const token = (req.headers.authorization || '').replace('Bearer ', '');
+    if (!token) return res.status(401).json({ error: 'No token' });
+    try { req.user = jwt.verify(token, JWT_SECRET); next(); }
+    catch(e) { res.status(401).json({ error: 'Invalid token' }); }
+}
+function adminOnly(req, res, next) {
+    if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+    next();
+}
+
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2,6);
+
+// ── ROUTES ───────────────────────────────────────────────────
+
+// AUTH
+app.post('/api/auth/login', async (req, res) => {
+    try {
+        const { email, password } = req.body;
+        const user = await db.get('SELECT * FROM users WHERE email=?', email);
+        if (!user) return res.status(401).json({ error: 'Invalid email or password' });
+        const valid = user.password.startsWith('$2')
+            ? bcrypt.compareSync(password, user.password)
+            : password === user.password;
+        if (!valid) return res.status(401).json({ error: 'Invalid email or password' });
+        const payload = {
+            id:user.id, email:user.email, role:user.role, name:user.name,
+            semester:user.semester, batch:user.batch, isCR:!!user.is_cr,
+            employeeId:user.employee_id, enrollmentNumber:user.enrollment,
+            phoneNumber:user.phone_number, subjects:JSON.parse(user.subjects||'[]')
+        };
+        res.json({ token: jwt.sign(payload, JWT_SECRET, {expiresIn:'7d'}), user: payload });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// USERS
+app.get('/api/users', auth, async (req, res) => {
+    const rows = await db.all('SELECT * FROM users');
+    res.json(rows.map(u => ({
+        id:u.id, email:u.email, role:u.role, name:u.name,
+        phoneNumber:u.phone_number, employeeId:u.employee_id,
+        enrollmentNumber:u.enrollment, semester:u.semester,
+        batch:u.batch, isCR:!!u.is_cr,
+        subjects:JSON.parse(u.subjects||'[]'),
+        parentContact:u.parent, address:u.address
+    })));
+});
+app.post('/api/users', auth, adminOnly, async (req, res) => {
+    try {
+        const u = req.body; const id = u.id||(u.role+uid());
+        await db.run(`INSERT INTO users (id,email,password,role,name,phone_number,employee_id,enrollment,semester,batch,is_cr,subjects,parent,address) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            [id,u.email,bcrypt.hashSync(u.password||'pass123',10),u.role,u.name,u.phoneNumber||null,u.employeeId||null,u.enrollmentNumber||null,u.semester||null,u.batch||null,u.isCR?1:0,JSON.stringify(u.subjects||[]),u.parentContact||null,u.address||null]);
+        res.json({ id, success:true });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+app.put('/api/users/:id', auth, adminOnly, async (req, res) => {
+    try {
+        const u = req.body;
+        await db.run(`UPDATE users SET name=?,email=?,phone_number=?,employee_id=?,enrollment=?,semester=?,batch=?,is_cr=?,subjects=?,parent=?,address=? WHERE id=?`,
+            [u.name,u.email,u.phoneNumber||null,u.employeeId||null,u.enrollmentNumber||null,u.semester||null,u.batch||null,u.isCR?1:0,JSON.stringify(u.subjects||[]),u.parentContact||null,u.address||null,req.params.id]);
+        if (u.password) await db.run('UPDATE users SET password=? WHERE id=?',[bcrypt.hashSync(u.password,10),req.params.id]);
+        res.json({ success:true });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+app.delete('/api/users/:id', auth, adminOnly, async (req, res) => {
+    await db.run('DELETE FROM users WHERE id=?', req.params.id);
+    res.json({ success:true });
+});
+
+// ATTENDANCE
+app.get('/api/attendance', auth, async (req, res) => {
+    let rows;
+    if (req.user.role==='student') rows = await db.all('SELECT * FROM attendance WHERE student_id=? ORDER BY date DESC', req.user.id);
+    else if (req.query.batch && req.query.semester) rows = await db.all('SELECT * FROM attendance WHERE batch=? AND semester=? ORDER BY date DESC',[req.query.batch,req.query.semester]);
+    else rows = await db.all('SELECT * FROM attendance ORDER BY date DESC');
+    res.json(rows);
+});
+app.post('/api/attendance', auth, async (req, res) => {
+    try {
+        const a=req.body; const id=a.id||'att'+uid();
+        await db.run(`INSERT OR REPLACE INTO attendance (id,student_id,student_name,subject,date,time,status,semester,batch,teacher_name) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+            [id,a.studentId,a.studentName,a.subject,a.date,a.time,a.status,a.semester,a.batch,a.teacherName||null]);
+        res.json({ id, success:true });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+app.delete('/api/attendance/:id', auth, async (req, res) => {
+    await db.run('DELETE FROM attendance WHERE id=?', req.params.id);
+    res.json({ success:true });
+});
+
+// MARKS
+app.get('/api/marks', auth, async (req, res) => {
+    const rows = req.user.role==='student'
+        ? await db.all('SELECT * FROM marks WHERE student_id=?', req.user.id)
+        : await db.all('SELECT * FROM marks');
+    res.json(rows.map(m=>({...m,total:(m.internal||0)+(m.assessment||0)+(m.practical||0)})));
+});
+app.post('/api/marks', auth, async (req, res) => {
+    try {
+        const m=req.body; const id=m.id||'mark'+uid();
+        await db.run(`INSERT OR REPLACE INTO marks (id,student_id,student_name,subject,semester,internal,assessment,practical,percentage) VALUES (?,?,?,?,?,?,?,?,?)`,
+            [id,m.studentId,m.studentName,m.subject,m.semester,m.internal||0,m.assessment||0,m.practical||0,m.percentage||0]);
+        res.json({ id, success:true });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+app.put('/api/marks/:id', auth, async (req, res) => {
+    const m=req.body;
+    await db.run('UPDATE marks SET internal=?,assessment=?,practical=?,percentage=? WHERE id=?',
+        [m.internal||0,m.assessment||0,m.practical||0,m.percentage||0,req.params.id]);
+    res.json({ success:true });
+});
+app.delete('/api/marks/:id', auth, async (req, res) => {
+    await db.run('DELETE FROM marks WHERE id=?', req.params.id);
+    res.json({ success:true });
+});
+
+// MESSAGES
+app.get('/api/messages', auth, async (req, res) => {
+    const rows = await db.all('SELECT * FROM messages WHERE batch=? AND semester=? ORDER BY timestamp ASC',[req.query.batch, req.query.semester]);
+    res.json(rows.map(m=>({...m,seenBy:JSON.parse(m.seen_by||'[]')})));
+});
+app.post('/api/messages', auth, async (req, res) => {
+    try {
+        const m=req.body; const id='msg'+uid();
+        const expiresAt=m.mediaType?new Date(Date.now()+5*60*60*1000).toISOString():null;
+        await db.run(`INSERT INTO messages (id,sender_id,sender_name,sender_role,message,semester,batch,media_type,media_data,file_name,file_size,expires_at,seen_by,timestamp) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            [id,req.user.id,req.user.name,req.user.role,m.message||null,m.semester,m.batch,m.mediaType||null,m.mediaData||null,m.fileName||null,m.fileSize||null,expiresAt,JSON.stringify([req.user.id]),new Date().toISOString()]);
+        res.json({ id, success:true });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+app.put('/api/messages/seen-batch', auth, async (req, res) => {
+    const msgs = await db.all('SELECT id,seen_by FROM messages WHERE batch=? AND semester=?',[req.body.batch,req.body.semester]);
+    for (const m of msgs) {
+        const seen=JSON.parse(m.seen_by||'[]');
+        if (!seen.includes(req.user.id)) { seen.push(req.user.id); await db.run('UPDATE messages SET seen_by=? WHERE id=?',[JSON.stringify(seen),m.id]); }
+    }
+    res.json({ success:true });
+});
+
+// NOTICES
+app.get('/api/notices', auth, async (req, res) => res.json(await db.all('SELECT * FROM notices ORDER BY created_at DESC')));
+app.post('/api/notices', auth, adminOnly, async (req, res) => {
+    const n=req.body; const id='not'+uid();
+    await db.run('INSERT INTO notices (id,title,content,priority,date) VALUES (?,?,?,?,?)',[id,n.title,n.content,n.priority||'medium',n.date||new Date().toISOString().split('T')[0]]);
+    res.json({ id, success:true });
+});
+app.delete('/api/notices/:id', auth, adminOnly, async (req, res) => {
+    await db.run('DELETE FROM notices WHERE id=?', req.params.id); res.json({ success:true });
+});
+
+// EVENTS
+app.get('/api/events', auth, async (req, res) => res.json(await db.all('SELECT * FROM events ORDER BY date ASC')));
+app.post('/api/events', auth, adminOnly, async (req, res) => {
+    const e=req.body; const id='evt'+uid();
+    await db.run('INSERT INTO events (id,title,date,type,description) VALUES (?,?,?,?,?)',[id,e.title,e.date,e.type,e.description||null]);
+    res.json({ id, success:true });
+});
+app.delete('/api/events/:id', auth, adminOnly, async (req, res) => {
+    await db.run('DELETE FROM events WHERE id=?', req.params.id); res.json({ success:true });
+});
+
+// LEAVE
+app.get('/api/leave', auth, async (req, res) => {
+    const rows = req.user.role==='student'
+        ? await db.all('SELECT * FROM leave_requests WHERE student_id=? ORDER BY created_at DESC', req.user.id)
+        : await db.all('SELECT * FROM leave_requests ORDER BY created_at DESC');
+    res.json(rows);
+});
+app.post('/api/leave', auth, async (req, res) => {
+    const l=req.body; const id='lv'+uid();
+    await db.run('INSERT INTO leave_requests (id,student_id,student_name,type,reason,from_date,to_date) VALUES (?,?,?,?,?,?,?)',
+        [id,req.user.id,req.user.name,l.type||null,l.reason,l.fromDate,l.toDate]);
+    res.json({ id, success:true });
+});
+app.put('/api/leave/:id', auth, async (req, res) => {
+    await db.run('UPDATE leave_requests SET status=? WHERE id=?',[req.body.status,req.params.id]);
+    res.json({ success:true });
+});
+
+// TIMETABLE
+app.get('/api/timetable', auth, async (req, res) => {
+    const rows = req.query.batch && req.query.semester
+        ? await db.all('SELECT * FROM timetable WHERE batch=? AND semester=? ORDER BY day,start_time',[req.query.batch,req.query.semester])
+        : await db.all('SELECT * FROM timetable ORDER BY semester,day,start_time');
+    res.json(rows.map(r=>({...r,startTime:r.start_time,endTime:r.end_time})));
+});
+app.post('/api/timetable', auth, async (req, res) => {
+    const t=req.body; const id=t.id||'tt'+uid();
+    await db.run('INSERT OR REPLACE INTO timetable (id,semester,batch,day,subject,start_time,end_time,teacher,room,type,color) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+        [id,t.semester,t.batch,t.day,t.subject,t.start||t.startTime,t.end||t.endTime,t.teacher||null,t.room||null,t.type||'Lecture',t.color||0]);
+    res.json({ id, success:true });
+});
+app.delete('/api/timetable/:id', auth, async (req, res) => {
+    await db.run('DELETE FROM timetable WHERE id=?', req.params.id); res.json({ success:true });
+});
+
+// ACHIEVEMENTS
+app.get('/api/achievements', auth, async (req, res) => {
+    const rows = await db.all('SELECT * FROM achievements ORDER BY created_at DESC');
+    res.json(rows.map(a=>({...a,tags:JSON.parse(a.tags||'[]')})));
+});
+app.post('/api/achievements', auth, async (req, res) => {
+    const a=req.body; const id='ach'+uid();
+    await db.run('INSERT INTO achievements (id,category,title,description,student,semester,date,tags,added_by) VALUES (?,?,?,?,?,?,?,?,?)',
+        [id,a.category,a.title,a.description||null,a.student,a.semester||null,a.date||null,JSON.stringify(a.tags||[]),req.user.id]);
+    res.json({ id, success:true });
+});
+app.delete('/api/achievements/:id', auth, async (req, res) => {
+    await db.run('DELETE FROM achievements WHERE id=?', req.params.id); res.json({ success:true });
+});
+
+// PROJECT GROUPS
+app.get('/api/project-groups', auth, async (req, res) => {
+    const rows = await db.all('SELECT * FROM project_groups ORDER BY created_at DESC');
+    res.json(rows.map(g=>({...g,memberIds:JSON.parse(g.member_ids||'[]'),teacherId:g.teacher_id,leaderId:g.leader_id})));
+});
+app.post('/api/project-groups', auth, async (req, res) => {
+    const g=req.body; const id='pg'+uid();
+    await db.run('INSERT INTO project_groups (id,name,description,subject,deadline,teacher_id,leader_id,member_ids,semester,batch) VALUES (?,?,?,?,?,?,?,?,?,?)',
+        [id,g.name,g.description||null,g.subject||null,g.deadline||null,g.teacherId||null,g.leaderId||req.user.id,JSON.stringify(g.memberIds||[req.user.id]),g.semester||null,g.batch||null]);
+    res.json({ id, success:true });
+});
+app.put('/api/project-groups/:id', auth, async (req, res) => {
+    const g=req.body;
+    await db.run('UPDATE project_groups SET name=?,description=?,subject=?,deadline=?,leader_id=?,member_ids=? WHERE id=?',
+        [g.name,g.description||null,g.subject||null,g.deadline||null,g.leaderId||null,JSON.stringify(g.memberIds||[]),req.params.id]);
+    res.json({ success:true });
+});
+
+// PROJECT POSTS
+app.get('/api/project-posts', auth, async (req, res) => {
+    const rows = req.query.groupId
+        ? await db.all('SELECT * FROM project_posts WHERE group_id=? ORDER BY timestamp ASC', req.query.groupId)
+        : await db.all('SELECT * FROM project_posts ORDER BY timestamp ASC');
+    res.json(rows.map(p=>({...p,groupId:p.group_id,senderId:p.sender_id,senderName:p.sender_name,senderRole:p.sender_role,mediaType:p.media_type,mediaData:p.media_data,fileName:p.file_name,fileSize:p.file_size,expiresAt:p.expires_at,likes:JSON.parse(p.likes||'[]')})));
+});
+app.post('/api/project-posts', auth, async (req, res) => {
+    const p=req.body; const id='pp'+uid();
+    await db.run('INSERT INTO project_posts (id,group_id,sender_id,sender_name,sender_role,message,status,media_type,media_data,file_name,file_size,expires_at,likes,timestamp) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        [id,p.groupId,req.user.id,req.user.name,req.user.role,p.message||null,p.status||'inprogress',p.mediaType||null,p.mediaData||null,p.fileName||null,p.fileSize||null,p.mediaType?new Date(Date.now()+5*60*60*1000).toISOString():null,'[]',new Date().toISOString()]);
+    res.json({ id, success:true });
+});
+
+// NOTIFICATIONS
+app.get('/api/notifications', auth, async (req, res) => {
+    const rows = await db.all(`SELECT * FROM notifications WHERE (target_user_id IS NULL OR target_user_id=?) AND (target_role IS NULL OR target_role=?) AND (exclude_id IS NULL OR exclude_id!=?) ORDER BY created_at DESC LIMIT 60`,
+        [req.user.id, req.user.role, req.user.id]);
+    res.json(rows.map(n=>({...n,readBy:JSON.parse(n.read_by||'[]'),isRead:JSON.parse(n.read_by||'[]').includes(req.user.id)})));
+});
+app.post('/api/notifications', auth, async (req, res) => {
+    const n=req.body; const id='notif'+uid();
+    await db.run('INSERT INTO notifications (id,type,title,body,target_role,target_user_id,exclude_id,target_batch,target_semester) VALUES (?,?,?,?,?,?,?,?,?)',
+        [id,n.type,n.title,n.body||null,n.targetRole||null,n.targetUserId||null,n.excludeId||null,n.targetBatch||null,n.targetSemester||null]);
+    res.json({ id, success:true });
+});
+app.put('/api/notifications/:id/read', auth, async (req, res) => {
+    const n = await db.get('SELECT read_by FROM notifications WHERE id=?', req.params.id);
+    if (!n) return res.status(404).json({ error:'Not found' });
+    const rb=JSON.parse(n.read_by||'[]');
+    if (!rb.includes(req.user.id)) rb.push(req.user.id);
+    await db.run('UPDATE notifications SET read_by=? WHERE id=?',[JSON.stringify(rb),req.params.id]);
+    res.json({ success:true });
+});
+app.put('/api/notifications/read-all', auth, async (req, res) => {
+    const rows = await db.all('SELECT id,read_by FROM notifications');
+    for (const n of rows) {
+        const rb=JSON.parse(n.read_by||'[]');
+        if (!rb.includes(req.user.id)) { rb.push(req.user.id); await db.run('UPDATE notifications SET read_by=? WHERE id=?',[JSON.stringify(rb),n.id]); }
+    }
+    res.json({ success:true });
+});
+
+// HEALTH
+app.get('/api/health', (req, res) => res.json({ status:'ok', time:new Date().toISOString(), version:'3.0' }));
+
+// SERVE FRONTEND
+app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+
+// ── START ────────────────────────────────────────────────────
+initDB().then(() => {
+    app.listen(PORT, HOST, () => {
+        console.log(`\n🎓 ECE Portal running at http://localhost:${PORT}\n`);
+    });
+}).catch(err => {
+    console.error('Failed to start:', err);
+    process.exit(1);
+});
     email        TEXT NOT NULL UNIQUE,
     password     TEXT NOT NULL,
     role         TEXT NOT NULL CHECK(role IN ('admin','teacher','student')),
